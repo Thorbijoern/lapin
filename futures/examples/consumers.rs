@@ -19,7 +19,7 @@ use lapin::channel::{BasicConsumeOptions, BasicProperties, BasicPublishOptions, 
 const N_CONSUMERS : u8 = 8;
 const N_MESSAGES  : u8 = 5;
 
-fn create_consumer<T: AsyncRead + AsyncWrite + Sync + Send + 'static>(client: &Client<T>, n: u8) -> impl Future<Item = (), Error = ()> + Send + 'static {
+fn create_consumer<T: AsyncRead + AsyncWrite + Sync + Send + 'static>(client: &Client<T>, n: u8) -> impl Future<Output = Result<(), ()>> + Send + 'static {
     info!("will create consumer {}", n);
 
     let queue = format!("test-queue-{}", n);

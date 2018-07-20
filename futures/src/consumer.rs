@@ -1,9 +1,11 @@
-use futures::{Async,Poll,Stream,task};
+use futures_core::Stream;
 use lapin_async::consumer::ConsumerSubscriber;
 use tokio_io::{AsyncRead,AsyncWrite};
 use std::collections::VecDeque;
 use std::io;
+use std::mem::PinMut;
 use std::sync::{Arc,Mutex};
+use std::task::{self,Poll};
 
 use message::Delivery;
 use transport::*;
@@ -18,9 +20,11 @@ impl ConsumerSubscriber for ConsumerSub {
     trace!("new_delivery;");
     if let Ok(mut inner) = self.inner.lock() {
       inner.deliveries.push_back(delivery);
-      if let Some(task) = inner.task.as_ref() {
-        task.notify();
+      /*
+      if let Some(ctx) = inner.ctx.as_ref() {
+        ctx.waker().wake();
       }
+      */
     } else {
       // FIXME: what do we do here?
       error!("new_delivery; mutex error");
@@ -40,14 +44,14 @@ pub struct Consumer<T> {
 #[derive(Debug)]
 struct ConsumerInner {
   deliveries: VecDeque<Delivery>,
-  task:       Option<task::Task>,
+  //ctx:        Option<PinMut<'static, task::Context<'static>>>,
 }
 
 impl Default for ConsumerInner {
   fn default() -> Self {
     Self {
       deliveries: VecDeque::new(),
-      task:       None,
+      //ctx:        None,
     }
   }
 }
@@ -75,34 +79,34 @@ impl<T: AsyncRead+AsyncWrite+Sync+Send+'static> Consumer<T> {
 }
 
 impl<T: AsyncRead+AsyncWrite+Sync+Send+'static> Stream for Consumer<T> {
-  type Item = Delivery;
-  type Error = io::Error;
+  type Item = Result<Delivery, io::Error>;
 
-  fn poll(&mut self) -> Poll<Option<Delivery>, io::Error> {
+  fn poll_next(self: PinMut<Self>, ctx: &mut task::Context) -> Poll<Option<Self::Item>> {
     trace!("consumer poll; consumer_tag={:?} polling transport", self.consumer_tag);
-    let mut transport = lock_transport!(self.transport);
-    transport.poll()?;
+    let mut transport = lock_transport!(self.transport, ctx);
+    transport.poll_next(ctx)?;
     let mut inner = match self.inner.lock() {
       Ok(inner) => inner,
       Err(_)    => if self.inner.is_poisoned() {
         return Err(io::Error::new(io::ErrorKind::Other, "Consumer mutex is poisoned"))
       } else {
-        task::current().notify();
-        return Ok(Async::NotReady)
+        ctx.waker().wake();
+        return Poll::Pending;
       },
     };
     trace!("consumer poll; consumer_tag={:?} acquired inner lock", self.consumer_tag);
-    if inner.task.is_none() {
-      let task = task::current();
-      task.notify();
-      inner.task = Some(task);
+    /*
+    if inner.ctx.is_none() {
+      ctx.waker().wake();
+      inner.ctx = Some(PinMut::new(ctx));
     }
+    */
     if let Some(delivery) = inner.deliveries.pop_front() {
       trace!("delivery; consumer_tag={:?} delivery_tag={:?}", self.consumer_tag, delivery.delivery_tag);
-      Ok(Async::Ready(Some(delivery)))
+      Poll::Ready(Ok(Some(delivery)))
     } else {
-      trace!("delivery; consumer_tag={:?} status=NotReady", self.consumer_tag);
-      Ok(Async::NotReady)
+      trace!("delivery; consumer_tag={:?} status=Pending", self.consumer_tag);
+      Poll::Pending
     }
   }
 }

@@ -1,3 +1,4 @@
+#![feature(arbitrary_self_types, futures_api, pin)]
 //! lapin-futures
 //!
 //! This library offers a futures based API over the lapin-async library.
@@ -125,7 +126,10 @@
 extern crate amq_protocol;
 extern crate cookie_factory;
 extern crate bytes;
-extern crate futures;
+extern crate futures_channel;
+extern crate futures_core;
+extern crate futures_sink;
+extern crate futures_util;
 extern crate lapin_async;
 #[macro_use] extern crate log;
 extern crate nom;

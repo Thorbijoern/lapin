@@ -3,11 +3,14 @@ use lapin_async;
 use std::default::Default;
 use std::io;
 use std::str::FromStr;
-use futures::{future,task,Async,Future,Poll,Stream};
-use futures::sync::oneshot;
+use futures_channel::oneshot;
+use futures_util::future;
 use tokio_io::{AsyncRead,AsyncWrite};
 use tokio_timer::Interval;
+use std::future::Future;
+use std::mem::PinMut;
 use std::sync::{Arc,Mutex};
+use std::task::{self,Poll};
 use std::time::{Duration,Instant};
 
 use transport::*;
@@ -73,33 +76,36 @@ impl FromStr for ConnectionOptions {
 
 pub type ConnectionConfiguration = lapin_async::connection::Configuration;
 
-fn heartbeat_pulse<T: AsyncRead+AsyncWrite+Send+'static>(transport: Arc<Mutex<AMQPTransport<T>>>, heartbeat: u16, rx: oneshot::Receiver<()>) -> impl Future<Item = (), Error = io::Error> + Send + 'static {
-    let interval  = if heartbeat == 0 {
-        Err(())
-    } else {
-        Ok(Interval::new(Instant::now(), Duration::from_secs(heartbeat.into()))
-           .map_err(|err| io::Error::new(io::ErrorKind::Other, err)))
-    };
+fn heartbeat_pulse<T: AsyncRead+AsyncWrite+Send+'static>(transport: Arc<Mutex<AMQPTransport<T>>>, heartbeat: u16) -> (impl Future<Output = Result<(), io::Error>> + Send + 'static, future::AbortHandle) {
+  let interval  = if heartbeat == 0 {
+    Err(())
+  } else {
+    Ok(Interval::new(Instant::now(), Duration::from_secs(heartbeat.into()))
+       .map_err(|err| io::Error::new(io::ErrorKind::Other, err)))
+  };
 
-    future::select_all(vec![
-        future::Either::A(rx.map(|_| debug!("Stopping heartbeat")).or_else(|_| future::empty())),
-        future::Either::B(future::result(interval).or_else(|_| future::empty()).and_then(move |interval| {
-            interval.for_each(move |_| {
-                debug!("poll heartbeat");
+  let heartbeat_future = interval.into_future().or_else(|_| future::empty()).and_then(move |interval| {
+    interval.for_each(move |_| {
+      debug!("poll heartbeat");
 
-                let transport = transport.clone();
+      let transport = transport.clone();
 
-                future::poll_fn(move || {
-                    let mut transport = lock_transport!(transport);
-                    debug!("Sending heartbeat");
-                    transport.send_heartbeat()
-                }).map(|_| ()).map_err(|err| {
-                    error!("Error occured in heartbeat interval: {}", err);
-                    err
-                })
-            })
-        })),
-    ]).map(|_| ()).map_err(|(err, ..)| err)
+      future::poll_fn(move |ctx| {
+        let mut transport = lock_transport!(transport, ctx);
+        debug!("Sending heartbeat");
+        transport.send_heartbeat()
+      }).map(|_| ())
+    }).map_err(|err| {
+      if let Err(Aborted) = err {
+        err
+      } else {
+        error!("Error occured in heartbeat interval: {}", err);
+        err
+      }
+    })
+  });
+
+  future::abortable(heartbeat_future)
 }
 
 /// A heartbeat task.
@@ -118,21 +124,21 @@ impl<Pulse> Heartbeat<Pulse> {
     }
 }
 
-fn make_heartbeat<F, Pulse>(pulse_maker: F) -> Heartbeat<Pulse> where F: FnOnce(oneshot::Receiver<()>) -> Pulse {
-    let (tx, rx) = oneshot::channel();
+fn make_heartbeat<T, Pulse>(transport: Arc<Mutex<AMQPTransport<T>>>, heartbeat: u32) -> Heartbeat<Pulse> {
+    debug!("heartbeat; interval={}", heartbeat);
+    let (heartbeat_future, handle) = heartbeat_pulse(transport, heartbeat);
 
     Heartbeat {
-        handle: Some(HeartbeatHandle(tx)),
-        pulse:  pulse_maker(rx),
+        handle: Some(handle),
+        pulse:  heartbeat_future,
     }
 }
 
 impl<F> Future for Heartbeat<F> where F: Future {
-    type Item = F::Item;
-    type Error = F::Error;
+    type Output = F::Output;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.pulse.poll()
+    fn poll(self: PinMut<Self>, ctx: &mut task::Context) -> Poll<Self::Output> {
+        self.pulse.poll(ctx)
     }
 }
 
@@ -193,16 +199,13 @@ impl<T: AsyncRead+AsyncWrite+Send+Sync+'static> Client<T> {
   /// # }
   /// ```
   pub fn connect(stream: T, options: ConnectionOptions) ->
-    impl Future<Item = (Self, Heartbeat<impl Future<Item = (), Error = io::Error> + Send + 'static>), Error = io::Error> + Send + 'static
+    impl Future<Output = Result<(Self, Heartbeat<impl Future<Output = Result<(), io::Error> + Send + 'static>), io::Error>>> + Send + 'static
   {
     AMQPTransport::connect(stream, options).and_then(|transport| {
       debug!("got client service");
       let configuration = transport.conn.configuration.clone();
       let transport = Arc::new(Mutex::new(transport));
-      let heartbeat = make_heartbeat(|rx| {
-        debug!("heartbeat; interval={}", configuration.heartbeat);
-        heartbeat_pulse(transport.clone(), configuration.heartbeat, rx)
-      });
+      let heartbeat = make_heartbeat(transport.clone(), configuration.heartbeat);
       let client = Client { configuration, transport };
       Ok((client, heartbeat))
     })
@@ -211,13 +214,13 @@ impl<T: AsyncRead+AsyncWrite+Send+Sync+'static> Client<T> {
   /// creates a new channel
   ///
   /// returns a future that resolves to a `Channel` once the method succeeds
-  pub fn create_channel(&self) -> impl Future<Item = Channel<T>, Error = io::Error> + Send + 'static {
+  pub fn create_channel(&self) -> impl Future<Output = Result<Channel<T>, io::Error>> + Send + 'static {
     Channel::create(self.transport.clone())
   }
 
   /// returns a future that resolves to a `Channel` once the method succeeds
   /// the channel will support RabbitMQ's confirm extension
-  pub fn create_confirm_channel(&self, options: ConfirmSelectOptions) -> impl Future<Item = Channel<T>, Error = io::Error> + Send + 'static {
+  pub fn create_confirm_channel(&self, options: ConfirmSelectOptions) -> impl Future<Output = Result<Channel<T>, io::Error>> + Send + 'static {
     //FIXME: maybe the confirm channel should be a separate type
     //especially, if we implement transactions, the methods should be available on the original channel
     //but not on the confirm channel. And the basic publish method should have different results
