@@ -65,14 +65,14 @@ fn main() {
   conn.run(&mut stream, &mut send_buffer, &mut receive_buffer).unwrap();
   assert!(conn.check_state(channel_id, ChannelState::Connected).map_err(|e| println!("{:?}", e)).is_ok());
 
-  /* Declaire the "hellp" queue */
+  /* Declaire the "hello" queue */
   let request_id = conn.queue_declare(channel_id, 0, "hello".to_string(), false, false, false, false, false, FieldTable::default()).unwrap();
   conn.run(&mut stream, &mut send_buffer, &mut receive_buffer).unwrap();
   thread::sleep(time::Duration::from_millis(100));
   conn.run(&mut stream, &mut send_buffer, &mut receive_buffer).unwrap();
   assert!(conn.has_finished(request_id).unwrap_or(false));
 
-  /* Publish "Hellow world!" to the "hello" queue */
+  /* Publish "Hello world!" to the "hello" queue */
   conn.basic_publish(channel_id, 0, "".to_string(), "hello".to_string(), false, false).expect("basic_publish");
   let payload = b"Hello world!";
   conn.send_content_frames(channel_id, 60, payload, BasicProperties::default());
